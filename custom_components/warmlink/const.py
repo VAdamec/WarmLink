@@ -9,8 +9,8 @@ CONF_DEVICE_CODE = "device_code"
 CONF_DEVICE_NAME = "device_name"
 CONF_SCAN_INTERVAL = "scan_interval"
 
-DEFAULT_SCAN_INTERVAL = 30
-MIN_SCAN_INTERVAL = 20
+DEFAULT_SCAN_INTERVAL = 60
+MIN_SCAN_INTERVAL = 30
 
 CLOUD_URL = "https://cloud.linked-go.com:449/crmservice/api"
 APP_ID = "16"

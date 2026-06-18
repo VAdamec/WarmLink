@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
 import re
 from typing import Any
 
@@ -10,6 +12,10 @@ from .const import APP_ID, CLOUD_URL, LANGUAGE, REQUEST_CODES
 from .models import WarmLinkData, WarmLinkDevice, WarmLinkField
 
 MD5_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+LOGGER = logging.getLogger(__name__)
+
+REQUEST_RETRY_DELAYS: tuple[int, ...] = (1, 3, 7)
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
 
 
 class WarmLinkApiError(Exception):
@@ -64,15 +70,27 @@ class WarmLinkApi:
         if token:
             headers["x-token"] = token
 
-        try:
-            response = await self._session.post(
-                self._app_url(endpoint),
-                json=payload,
-                headers=headers,
-            )
-            response.raise_for_status()
-        except (ClientError, ClientResponseError) as err:
-            raise WarmLinkApiError(f"HTTP error calling {endpoint}: {err}") from err
+        for attempt in range(len(REQUEST_RETRY_DELAYS) + 1):
+            try:
+                response = await self._session.post(
+                    self._app_url(endpoint),
+                    json=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                break
+            except (TimeoutError, ClientError) as err:
+                if not _should_retry_http_error(err) or attempt == len(REQUEST_RETRY_DELAYS):
+                    raise WarmLinkApiError(f"HTTP error calling {endpoint}: {err}") from err
+
+                delay = REQUEST_RETRY_DELAYS[attempt]
+                LOGGER.debug(
+                    "Retrying WarmLink request to %s in %s seconds after error: %s",
+                    endpoint,
+                    delay,
+                    err,
+                )
+                await asyncio.sleep(delay)
 
         try:
             return await response.json(content_type=None)
@@ -158,6 +176,9 @@ class WarmLinkApi:
         return self._parse_devices(response)
 
     async def _async_ensure_device(self) -> WarmLinkDevice:
+        if self._device is not None:
+            return self._device
+
         devices = await self.async_get_devices()
 
         if not devices:
@@ -177,104 +198,3 @@ class WarmLinkApi:
 
     async def async_fetch_data(self) -> WarmLinkData:
         device = await self._async_ensure_device()
-        payload = {"deviceCode": device.code}
-        status_response = await self._async_request("device/getDeviceStatus", payload)
-
-        info_response = await self._async_request(
-            "device/getDataByCode",
-            {
-                "deviceCode": device.code,
-                "appId": APP_ID,
-                "protocalCodes": list(REQUEST_CODES),
-            },
-        )
-
-        status_payload = status_response.get("objectResult") or {}
-        is_fault = bool(status_payload.get("is_fault", status_payload.get("isFault", False)))
-        fault_message = "No error"
-
-        if is_fault:
-            try:
-                fault_response = await self._async_request(
-                    "device/getFaultDataByDeviceCode",
-                    payload,
-                )
-            except WarmLinkApiError:
-                fault_message = "Fault details unavailable"
-            else:
-                descriptions = [
-                    item.get("description")
-                    for item in (fault_response.get("objectResult") or [])
-                    if item.get("description")
-                ]
-                fault_message = descriptions[0] if descriptions else "Fault details unavailable"
-
-        fields: dict[str, WarmLinkField] = {}
-        for item in info_response.get("objectResult") or []:
-            code = item.get("code")
-            if not code:
-                continue
-
-            fields[code] = WarmLinkField(
-                value=item.get("value"),
-                range_start=_parse_float(item.get("rangeStart")),
-                range_end=_parse_float(item.get("rangeEnd")),
-            )
-
-        return WarmLinkData(
-            device=device,
-            status=str(status_payload.get("status", "UNKNOWN")),
-            is_fault=is_fault,
-            fault_message=fault_message,
-            fields=fields,
-        )
-
-    async def _async_control(self, protocol_code: str, value: str) -> None:
-        device = await self._async_ensure_device()
-        payload = {
-            "param": [
-                {
-                    "deviceCode": device.code,
-                    "protocolCode": protocol_code,
-                    "value": value,
-                }
-            ]
-        }
-        await self._async_request("device/control", payload)
-
-    async def async_set_power(self, enabled: bool) -> None:
-        await self._async_control("Power", "1" if enabled else "0")
-
-    async def async_set_mode_code(self, mode_code: str) -> None:
-        await self.async_set_power(True)
-        await self._async_control("Mode", mode_code)
-
-    async def async_set_mode(self, mode: str) -> None:
-        mode_map = {
-            "water": "1",
-            "heat": "2",
-            "dhw": "3",
-        }
-        if mode not in mode_map:
-            raise WarmLinkApiError(f"Unsupported mode: {mode}")
-
-        await self.async_set_mode_code(mode_map[mode])
-
-    async def async_set_target_temperature(self, temperature: float) -> None:
-        await self._async_control("R02", f"{temperature:.1f}".rstrip("0").rstrip("."))
-
-    async def async_set_dhw_temperature(self, temperature: float) -> None:
-        await self._async_control("R01", f"{temperature:.1f}".rstrip("0").rstrip("."))
-
-    async def async_set_silent(self, enabled: bool) -> None:
-        await self._async_control("Timer_Mute_On_En", "1" if enabled else "0")
-
-
-def _parse_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
